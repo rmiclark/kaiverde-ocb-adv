@@ -739,4 +739,711 @@ class DistributionFactory:
     
     @staticmethod
     def create_triangular(min_val: float, mode: float, max_val: float) -> TriangularDistribution:
-        return
+        return TriangularDistribution(min_val, mode, max_val)
+    
+    @staticmethod
+    def create_lognormal(mu: float, sigma: float) -> LogNormalDistribution:
+        return LogNormalDistribution(mu, sigma)
+    
+    @staticmethod
+    def create_beta(alpha: float, beta: float) -> BetaDistribution:
+        return BetaDistribution(alpha, beta)
+    
+    @staticmethod
+    def create_gamma(shape: float, scale: float) -> GammaDistribution:
+        return GammaDistribution(shape, scale)
+    
+    @staticmethod
+    def create_exponential(scale: float) -> ExponentialDistribution:
+        return ExponentialDistribution(scale)
+    
+    @staticmethod
+    def create_poisson(lam: float) -> PoissonDistribution:
+        return PoissonDistribution(lam)
+    
+    @staticmethod
+    def create_binomial(n: int, p: float) -> BinomialDistribution:
+        return BinomialDistribution(n, p)
+    
+    @staticmethod
+    def create_discrete(values: List[float], probabilities: List[float]) -> DiscreteDistribution:
+        return DiscreteDistribution(values, probabilities)
+
+# ==================== API SERVICE LAYER ====================
+
+# Pydantic models for API requests and responses
+class DistributionConfig(BaseModel):
+    """Configuration for probability distributions"""
+    type: str = Field(..., description="Distribution type: normal, uniform, triangular, lognormal, beta, gamma, exponential, poisson, binomial, discrete")
+    parameters: Dict[str, float] = Field(..., description="Distribution parameters")
+
+class AssumptionConfig(BaseModel):
+    """Configuration for model assumptions"""
+    name: str = Field(..., description="Name of the assumption")
+    description: Optional[str] = Field("", description="Description of the assumption")
+    distribution: DistributionConfig = Field(..., description="Probability distribution")
+
+class FormulaConfig(BaseModel):
+    """Configuration for forecast formulas"""
+    expression: str = Field(..., description="Mathematical expression using assumption names")
+    variables: List[str] = Field(..., description="List of variable names used in expression")
+
+class ForecastConfig(BaseModel):
+    """Configuration for model forecasts"""
+    name: str = Field(..., description="Name of the forecast")
+    description: Optional[str] = Field("", description="Description of the forecast")
+    formula: FormulaConfig = Field(..., description="Formula configuration")
+
+class SimulationConfig(BaseModel):
+    """Complete simulation configuration"""
+    assumptions: List[AssumptionConfig] = Field(..., description="List of model assumptions")
+    forecasts: List[ForecastConfig] = Field(..., description="List of model forecasts")
+    trials: int = Field(10000, description="Number of Monte Carlo trials", ge=100, le=100000)
+    seed: Optional[int] = Field(None, description="Random seed for reproducible results")
+
+class SimulationResponse(BaseModel):
+    """Response containing simulation results"""
+    simulation_id: str
+    status: str
+    timestamp: str
+    config: SimulationConfig
+    results: Optional[Dict[str, Any]] = None
+    charts: Optional[Dict[str, str]] = None  # Base64 encoded images
+    report: Optional[str] = None
+    error: Optional[str] = None
+
+# Global storage for simulation instances (in production, use Redis or database)
+simulation_cache: Dict[str, CrystalBallMVP] = {}
+
+# Initialize FastAPI app
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    print("Crystal Ball API starting up...")
+    yield
+    # Shutdown
+    print("Crystal Ball API shutting down...")
+
+app = FastAPI(
+    title="Crystal Ball MVP API",
+    description="Monte Carlo Simulation API for risk analysis and forecasting",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# Add CORS middleware for Google Sheets integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, restrict to specific domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Helper functions
+def create_distribution(dist_config: DistributionConfig) -> ProbabilityDistribution:
+    """Create a probability distribution from configuration"""
+    dist_type = dist_config.type.lower()
+    params = dist_config.parameters
+    
+    if dist_type == "normal":
+        return DistributionFactory.create_normal(params["mean"], params["std"])
+    elif dist_type == "uniform":
+        return DistributionFactory.create_uniform(params["min"], params["max"])
+    elif dist_type == "triangular":
+        return DistributionFactory.create_triangular(params["min"], params["mode"], params["max"])
+    elif dist_type == "lognormal":
+        return DistributionFactory.create_lognormal(params["mu"], params["sigma"])
+    elif dist_type == "beta":
+        return DistributionFactory.create_beta(params["alpha"], params["beta"])
+    elif dist_type == "gamma":
+        return DistributionFactory.create_gamma(params["shape"], params["scale"])
+    elif dist_type == "exponential":
+        return DistributionFactory.create_exponential(params["scale"])
+    elif dist_type == "poisson":
+        return DistributionFactory.create_poisson(params["lambda"])
+    elif dist_type == "binomial":
+        return DistributionFactory.create_binomial(int(params["n"]), params["p"])
+    elif dist_type == "discrete":
+        return DistributionFactory.create_discrete(params["values"], params["probabilities"])
+    else:
+        raise ValueError(f"Unsupported distribution type: {dist_type}")
+
+def create_formula_function(formula_config: FormulaConfig) -> Callable:
+    """Create a callable function from formula configuration"""
+    expression = formula_config.expression
+    variables = formula_config.variables
+    
+    def formula_func(assumptions: Dict[str, np.ndarray]) -> np.ndarray:
+        # Create a safe evaluation environment
+        allowed_names = {
+            "np": np,
+            "abs": abs,
+            "min": min,
+            "max": max,
+            "sum": sum,
+            "len": len,
+            "pow": pow,
+            "exp": np.exp,
+            "log": np.log,
+            "sqrt": np.sqrt,
+        }
+        
+        # Add assumption variables
+        for var in variables:
+            if var in assumptions:
+                allowed_names[var] = assumptions[var]
+            else:
+                raise KeyError(f"Variable '{var}' not found in assumptions")
+        
+        try:
+            # Evaluate the expression safely
+            result = eval(expression, {"__builtins__": {}}, allowed_names)
+            return np.array(result)
+        except Exception as e:
+            raise ValueError(f"Error evaluating formula '{expression}': {str(e)}")
+    
+    return formula_func
+
+# API Endpoints
+
+@app.get("/")
+async def root():
+    """Health check endpoint"""
+    return {
+        "service": "Crystal Ball MVP API",
+        "status": "healthy",
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/health")
+async def health_check():
+    """Detailed health check"""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.utcnow().isoformat(),
+        "active_simulations": len(simulation_cache)
+    }
+
+@app.post("/simulation/create", response_model=SimulationResponse)
+async def create_simulation(config: SimulationConfig):
+    """Create and run a Monte Carlo simulation"""
+    simulation_id = str(uuid.uuid4())
+    
+    try:
+        # Create Crystal Ball instance
+        cb = CrystalBallMVP()
+        cb.set_trials(config.trials)
+        
+        if config.seed is not None:
+            cb.set_seed(config.seed)
+        
+        # Add assumptions
+        for assumption_config in config.assumptions:
+            distribution = create_distribution(assumption_config.distribution)
+            assumption = Assumption(
+                name=assumption_config.name,
+                distribution=distribution,
+                description=assumption_config.description
+            )
+            cb.add_assumption(assumption)
+        
+        # Add forecasts
+        for forecast_config in config.forecasts:
+            formula_func = create_formula_function(forecast_config.formula)
+            forecast = Forecast(
+                name=forecast_config.name,
+                formula=formula_func,
+                description=forecast_config.description
+            )
+            cb.add_forecast(forecast)
+        
+        # Run simulation
+        cb.run_simulation()
+        
+        # Store simulation in cache
+        simulation_cache[simulation_id] = cb
+        
+        # Prepare results
+        results = {}
+        charts = {}
+        
+        for forecast_name in cb.forecasts.keys():
+            # Get statistics and percentiles
+            results[forecast_name] = {
+                "statistics": cb.get_statistics(forecast_name),
+                "percentiles": cb.get_percentiles(forecast_name),
+                "sensitivity": {
+                    "correlations": cb.sensitivity_analysis(forecast_name)["correlations"].to_dict("records"),
+                    "variance_contributions": cb.sensitivity_analysis(forecast_name)["variance_contributions"].to_dict("records")
+                }
+            }
+            
+            # Generate charts as base64 strings
+            charts[f"{forecast_name}_histogram"] = cb.plot_forecast_histogram(forecast_name)
+            charts[f"{forecast_name}_sensitivity"] = cb.plot_sensitivity_chart(forecast_name)
+        
+        # Generate report for first forecast
+        first_forecast = list(cb.forecasts.keys())[0]
+        report = cb.generate_report(first_forecast)
+        
+        return SimulationResponse(
+            simulation_id=simulation_id,
+            status="completed",
+            timestamp=datetime.utcnow().isoformat(),
+            config=config,
+            results=results,
+            charts=charts,
+            report=report
+        )
+        
+    except Exception as e:
+        return SimulationResponse(
+            simulation_id=simulation_id,
+            status="error",
+            timestamp=datetime.utcnow().isoformat(),
+            config=config,
+            error=str(e)
+        )
+
+@app.get("/simulation/{simulation_id}/results")
+async def get_simulation_results(simulation_id: str):
+    """Get results for a specific simulation"""
+    if simulation_id not in simulation_cache:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    
+    cb = simulation_cache[simulation_id]
+    
+    # Prepare results
+    results = {}
+    for forecast_name in cb.forecasts.keys():
+        results[forecast_name] = {
+            "statistics": cb.get_statistics(forecast_name),
+            "percentiles": cb.get_percentiles(forecast_name),
+            "sensitivity": {
+                "correlations": cb.sensitivity_analysis(forecast_name)["correlations"].to_dict("records"),
+                "variance_contributions": cb.sensitivity_analysis(forecast_name)["variance_contributions"].to_dict("records")
+            }
+        }
+    
+    return {"simulation_id": simulation_id, "results": results}
+
+@app.get("/simulation/{simulation_id}/charts/{forecast_name}")
+async def get_forecast_charts(simulation_id: str, forecast_name: str, chart_type: str = "histogram"):
+    """Get charts for a specific forecast"""
+    if simulation_id not in simulation_cache:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    
+    cb = simulation_cache[simulation_id]
+    
+    if forecast_name not in cb.forecasts:
+        raise HTTPException(status_code=404, detail="Forecast not found")
+    
+    try:
+        if chart_type == "histogram":
+            chart_base64 = cb.plot_forecast_histogram(forecast_name)
+        elif chart_type == "sensitivity":
+            chart_base64 = cb.plot_sensitivity_chart(forecast_name)
+        else:
+            raise HTTPException(status_code=400, detail="Invalid chart type. Use 'histogram' or 'sensitivity'")
+        
+        return {"chart": chart_base64, "type": chart_type}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/simulation/{simulation_id}/report/{forecast_name}")
+async def get_forecast_report(simulation_id: str, forecast_name: str):
+    """Get text report for a specific forecast"""
+    if simulation_id not in simulation_cache:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    
+    cb = simulation_cache[simulation_id]
+    
+    if forecast_name not in cb.forecasts:
+        raise HTTPException(status_code=404, detail="Forecast not found")
+    
+    try:
+        report = cb.generate_report(forecast_name)
+        return {"report": report}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/simulation/{simulation_id}/export")
+async def export_simulation_results(simulation_id: str, format: str = "excel"):
+    """Export simulation results to file"""
+    if simulation_id not in simulation_cache:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    
+    cb = simulation_cache[simulation_id]
+    
+    # Create temporary file
+    with tempfile.NamedTemporaryFile(delete=False, suffix=f'.{format}') as tmp_file:
+        filename = tmp_file.name
+    
+    try:
+        cb.export_results(filename, format)
+        return FileResponse(
+            filename,
+            media_type='application/octet-stream',
+            filename=f"crystal_ball_results_{simulation_id[:8]}.{format}"
+        )
+    except Exception as e:
+        # Clean up temp file on error
+        if os.path.exists(filename):
+            os.unlink(filename)
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Schedule cleanup
+        def cleanup():
+            if os.path.exists(filename):
+                os.unlink(filename)
+        # In a real app, you'd use a background task or scheduled job
+        threading.Timer(60.0, cleanup).start()
+
+@app.delete("/simulation/{simulation_id}")
+async def delete_simulation(simulation_id: str):
+    """Delete a simulation from cache"""
+    if simulation_id not in simulation_cache:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    
+    del simulation_cache[simulation_id]
+    return {"message": f"Simulation {simulation_id} deleted successfully"}
+
+@app.get("/simulations")
+async def list_simulations():
+    """List all active simulations"""
+    simulations = []
+    for sim_id, cb in simulation_cache.items():
+        simulations.append({
+            "simulation_id": sim_id,
+            "forecasts": list(cb.forecasts.keys()),
+            "assumptions": list(cb.assumptions.keys()),
+            "trials": cb.trials
+        })
+    
+    return {"simulations": simulations, "count": len(simulations)}
+
+# Google Sheets friendly endpoints
+@app.post("/sheets/simple-simulation")
+async def simple_simulation_for_sheets(
+    assumptions_data: List[Dict[str, Any]],
+    forecast_formula: str,
+    forecast_variables: List[str],
+    trials: int = 10000,
+    seed: Optional[int] = None
+):
+    """Simplified endpoint optimized for Google Sheets integration"""
+    try:
+        # Build configuration from simplified inputs
+        assumptions_config = []
+        for assumption in assumptions_data:
+            dist_config = DistributionConfig(
+                type=assumption["distribution_type"],
+                parameters=assumption["parameters"]
+            )
+            assumptions_config.append(AssumptionConfig(
+                name=assumption["name"],
+                description=assumption.get("description", ""),
+                distribution=dist_config
+            ))
+        
+        forecast_config = ForecastConfig(
+            name="Primary_Forecast",
+            description="Main forecast output",
+            formula=FormulaConfig(
+                expression=forecast_formula,
+                variables=forecast_variables
+            )
+        )
+        
+        config = SimulationConfig(
+            assumptions=assumptions_config,
+            forecasts=[forecast_config],
+            trials=trials,
+            seed=seed
+        )
+        
+        # Run simulation using existing endpoint logic
+        response = await create_simulation(config)
+        
+        # Return simplified results for Google Sheets
+        if response.status == "completed" and response.results:
+            forecast_results = response.results["Primary_Forecast"]
+            return {
+                "status": "success",
+                "simulation_id": response.simulation_id,
+                "statistics": forecast_results["statistics"],
+                "percentiles": forecast_results["percentiles"],
+                "sensitivity": forecast_results["sensitivity"]["correlations"][:5]  # Top 5
+            }
+        else:
+            return {"status": "error", "error": response.error}
+            
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+@app.get("/sheets/results/{simulation_id}")
+async def get_sheets_results(simulation_id: str):
+    """Get results in a format optimized for Google Sheets"""
+    if simulation_id not in simulation_cache:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    
+    cb = simulation_cache[simulation_id]
+    
+    # Format results for easy import into Google Sheets
+    results = []
+    
+    for forecast_name in cb.forecasts.keys():
+        stats = cb.get_statistics(forecast_name)
+        percentiles = cb.get_percentiles(forecast_name)
+        
+        # Create flat structure for sheets
+        row = {
+            "Forecast": forecast_name,
+            "Mean": stats["mean"],
+            "Std_Dev": stats["std"],
+            "Min": stats["min"],
+            "Max": stats["max"],
+            "P5": percentiles["p5"],
+            "P25": percentiles["p25"],
+            "P50": percentiles["p50"],
+            "P75": percentiles["p75"],
+            "P95": percentiles["p95"]
+        }
+        results.append(row)
+    
+    return {"results": results}
+
+@app.get("/sheets/trials/{simulation_id}")
+async def get_trials_table(simulation_id: str):
+    """Return trial-level data in wide format for Google Sheets"""
+    if simulation_id not in simulation_cache:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    
+    cb = simulation_cache[simulation_id]
+    
+    try:
+        df = cb.trials_dataframe()
+        # Return as column-row format for Google Sheets Apps Script
+        return {
+            "columns": list(df.columns),
+            "rows": df.values.tolist()
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sheets/tornado/{simulation_id}/{forecast_name}")
+async def sheets_tornado(
+    simulation_id: str, 
+    forecast_name: str,
+    low_pct: int = 10, 
+    high_pct: int = 90, 
+    test_points: int = 5, 
+    baseline_pct: int = 50
+):
+    """Get tornado analysis data for Google Sheets"""
+    if simulation_id not in simulation_cache:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    
+    cb = simulation_cache[simulation_id]
+    
+    try:
+        df = cb.tornado_analysis(forecast_name, low_pct, high_pct, test_points, baseline_pct)
+        
+        # Create a summary table with swing data for sheets
+        swing_summary = df.groupby('Assumption').agg({
+            'Value': ['min', 'max'],
+            'Swing': 'first'
+        }).round(6)
+        
+        swing_summary.columns = ['Low_Value', 'High_Value', 'Swing']
+        swing_summary = swing_summary.reset_index()
+        swing_summary = swing_summary.sort_values('Swing', ascending=False)
+        
+        return {
+            "tornado_data": {
+                "columns": list(df.columns),
+                "rows": df.values.tolist()
+            },
+            "swing_summary": {
+                "columns": list(swing_summary.columns),
+                "rows": swing_summary.values.tolist()
+            }
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sheets/overlay/{simulation_id}/{forecast_name}")
+async def sheets_overlay(simulation_id: str, forecast_name: str, bins: int = 50):
+    """Get overlay/cumulative data for Google Sheets charts"""
+    if simulation_id not in simulation_cache:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    
+    cb = simulation_cache[simulation_id]
+    
+    try:
+        overlay_data = cb.binned_and_cdf_data(forecast_name, bins)
+        return overlay_data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/sheets/sensitivity/{simulation_id}/{forecast_name}")
+async def sheets_sensitivity(simulation_id: str, forecast_name: str):
+    """Get sensitivity analysis data in flat format for Google Sheets"""
+    if simulation_id not in simulation_cache:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    
+    cb = simulation_cache[simulation_id]
+    
+    try:
+        sensitivity = cb.sensitivity_analysis(forecast_name)
+        
+        # Format correlations for sheets
+        correlations = sensitivity['correlations']
+        corr_data = {
+            "columns": ["Assumption", "Correlation", "Absolute_Correlation", "Impact"],
+            "rows": []
+        }
+        
+        for _, row in correlations.iterrows():
+            impact = "High" if abs(row['Correlation']) > 0.5 else \
+                    "Medium" if abs(row['Correlation']) > 0.3 else "Low"
+            corr_data["rows"].append([
+                row['Assumption'],
+                round(row['Correlation'], 6),
+                round(row['Absolute_Correlation'], 6),
+                impact
+            ])
+        
+        # Format variance contributions for sheets
+        variance_contrib = sensitivity['variance_contributions']
+        var_data = {
+            "columns": ["Assumption", "Contribution", "Percentage"],
+            "rows": variance_contrib.round(6).values.tolist()
+        }
+        
+        return {
+            "correlations": corr_data,
+            "variance_contributions": var_data
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Health and diagnostics
+@app.get("/diagnostics")
+async def get_diagnostics():
+    """Get system diagnostics"""
+    import psutil
+    import sys
+    
+    return {
+        "system": {
+            "python_version": sys.version,
+            "cpu_count": psutil.cpu_count(),
+            "memory_percent": psutil.virtual_memory().percent,
+            "disk_usage": psutil.disk_usage('/').percent
+        },
+        "application": {
+            "active_simulations": len(simulation_cache),
+            "cache_memory_usage": sum(sys.getsizeof(cb) for cb in simulation_cache.values())
+        }
+    }
+
+# Example usage and testing endpoint
+@app.get("/example")
+async def get_example_config():
+    """Get an example configuration for testing"""
+    example_config = {
+        "assumptions": [
+            {
+                "name": "Price",
+                "description": "Product price per unit",
+                "distribution": {
+                    "type": "triangular",
+                    "parameters": {"min": 90, "mode": 100, "max": 120}
+                }
+            },
+            {
+                "name": "Quantity",
+                "description": "Expected quantity sold",
+                "distribution": {
+                    "type": "normal",
+                    "parameters": {"mean": 1000, "std": 150}
+                }
+            },
+            {
+                "name": "Market_Share",
+                "description": "Market share percentage",
+                "distribution": {
+                    "type": "beta",
+                    "parameters": {"alpha": 2, "beta": 8}
+                }
+            },
+            {
+                "name": "Cost_Factor",
+                "description": "Variable cost multiplier",
+                "distribution": {
+                    "type": "gamma",
+                    "parameters": {"shape": 2, "scale": 0.3}
+                }
+            }
+        ],
+        "forecasts": [
+            {
+                "name": "Revenue",
+                "description": "Total revenue forecast",
+                "formula": {
+                    "expression": "Price * Quantity * Market_Share",
+                    "variables": ["Price", "Quantity", "Market_Share"]
+                }
+            },
+            {
+                "name": "Profit",
+                "description": "Net profit forecast",
+                "formula": {
+                    "expression": "(Price * Quantity * Market_Share) - (50000 + Cost_Factor * 60 * Quantity * Market_Share)",
+                    "variables": ["Price", "Quantity", "Market_Share", "Cost_Factor"]
+                }
+            }
+        ],
+        "trials": 10000,
+        "seed": 42
+    }
+    
+    distribution_examples = {
+        "normal": {"mean": 100, "std": 15},
+        "uniform": {"min": 50, "max": 150},
+        "triangular": {"min": 80, "mode": 100, "max": 120},
+        "lognormal": {"mu": 0, "sigma": 0.5},
+        "beta": {"alpha": 2, "beta": 5},
+        "gamma": {"shape": 2, "scale": 1.5},
+        "exponential": {"scale": 10},
+        "poisson": {"lambda": 5},
+        "binomial": {"n": 100, "p": 0.3},
+        "discrete": {
+            "values": [10, 20, 30, 40, 50],
+            "probabilities": [0.1, 0.2, 0.4, 0.2, 0.1]
+        }
+    }
+    
+    return {
+        "example_config": example_config,
+        "distribution_examples": distribution_examples,
+        "new_endpoints": {
+            "trials_data": "/sheets/trials/{simulation_id}",
+            "tornado_analysis": "/sheets/tornado/{simulation_id}/{forecast_name}",
+            "overlay_data": "/sheets/overlay/{simulation_id}/{forecast_name}",
+            "sensitivity_flat": "/sheets/sensitivity/{simulation_id}/{forecast_name}"
+        }
+    }
+
+# Run the server
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 8080)),
+        reload=False
+    )
